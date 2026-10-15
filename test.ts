@@ -8,6 +8,8 @@ import {
   paneDestLines,
   parsePaneChoice,
   searchScript,
+  searchScriptPs,
+  togglePsScript,
   NEW_TAB_TOKEN,
   NEW_WS_TOKEN,
 } from "./pick-and-move.ts";
@@ -192,4 +194,74 @@ test("a query matching nothing still offers the named sentinels", () => {
     `${MUTE}＋ new tab “my new thing”${UNMUTE}\t${NEW_TAB_TOKEN}`,
     `${MUTE}＋ new workspace “my new thing”${UNMUTE}\t${NEW_WS_TOKEN}`,
   ]);
+});
+
+// Windows: the reload script is PowerShell, run by fzf as
+// `powershell -NoProfile -ExecutionPolicy Bypass -File <script>` with the
+// typed query in FZF_QUERY; exercise it the same way.
+const IS_WIN32 = process.platform === "win32";
+const HAS_PS = IS_WIN32 && spawnSync("powershell", ["-NoProfile", "-Command", "exit 0"], { encoding: "utf8" }).status === 0;
+const HAS_FZF = spawnSync("fzf", ["--version"], { encoding: "utf8" }).status === 0;
+
+function runSearchPs(query: string): string[] {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "drovr-test-"));
+  try {
+    const candidates = path.join(dir, "tabs.txt");
+    fs.writeFileSync(candidates, "logs\ttab:w1:t2\r\napi\ttab:w2:t1\r\n");
+    const ps1 = path.join(dir, "search.ps1");
+    fs.writeFileSync(ps1, "\ufeff" + searchScriptPs(`$cand = '${candidates}'`, [["＋ new tab", NEW_TAB_TOKEN], ["＋ new workspace", NEW_WS_TOKEN]]));
+    const r = spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1], {
+      encoding: "utf8",
+      env: { ...process.env, FZF_QUERY: query },
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return r.stdout.replace(/^\uFEFF/, "").split("\r\n").filter(Boolean);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("windows: an empty query lists every candidate, then the muted sentinels", { skip: !HAS_PS ? "PowerShell not available" : false }, () => {
+  assert.deepStrictEqual(runSearchPs(""), [
+    "logs\ttab:w1:t2",
+    "api\ttab:w2:t1",
+    `${MUTE}＋ new tab${UNMUTE}\t${NEW_TAB_TOKEN}`,
+    `${MUTE}＋ new workspace${UNMUTE}\t${NEW_WS_TOKEN}`,
+  ]);
+});
+
+test("windows: a query puts matches first and stamps it on the sentinels", { skip: !HAS_PS || !HAS_FZF ? "PowerShell/fzf not available" : false }, () => {
+  assert.deepStrictEqual(runSearchPs("log"), [
+    "logs\ttab:w1:t2",
+    `${MUTE}＋ new tab “log”${UNMUTE}\t${NEW_TAB_TOKEN}`,
+    `${MUTE}＋ new workspace “log”${UNMUTE}\t${NEW_WS_TOKEN}`,
+  ]);
+});
+
+test("windows: a query matching nothing still offers the named sentinels", { skip: !HAS_PS || !HAS_FZF ? "PowerShell/fzf not available" : false }, () => {
+  assert.deepStrictEqual(runSearchPs("my new thing"), [
+    `${MUTE}＋ new tab “my new thing”${UNMUTE}\t${NEW_TAB_TOKEN}`,
+    `${MUTE}＋ new workspace “my new thing”${UNMUTE}\t${NEW_WS_TOKEN}`,
+  ]);
+});
+
+test("windows: the ctrl-t helper flips the marker and the prompt on each run", { skip: !HAS_PS ? "PowerShell not available" : false }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "drovr-test-"));
+  try {
+    const allOn = path.join(dir, "all-on");
+    const ps1 = path.join(dir, "toggle.ps1");
+    fs.writeFileSync(ps1, togglePsScript(allOn));
+    const run = () =>
+      spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1], { encoding: "utf8" });
+    let r = run();
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout.replace(/^\uFEFF/, "").trim(), "change-prompt(move pane anywhere › )");
+    assert.ok(fs.existsSync(allOn));
+    r = run();
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(r.stdout.replace(/^\uFEFF/, "").trim(), "change-prompt(move pane to › )");
+    assert.ok(!fs.existsSync(allOn));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

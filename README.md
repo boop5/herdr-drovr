@@ -20,7 +20,9 @@ Herdr has no built-in "move tab to workspace", and recreating a tab by replaying
 
 - **herdr** `>= 0.7.4` -- the picker uses floating popup panels
 - **node** `>= 23` -- runs the TypeScript sources directly via native type stripping; no build step
-- **fzf** on `PATH` -- `brew install fzf` on macOS
+- **fzf** on `PATH` -- `brew install fzf` on macOS, `winget install fzf` (or `scoop install fzf`) on Windows
+
+Windows works like any other platform: the picker's shell glue is generated for the local shell (PowerShell on Windows instead of sh), and the typed query reaches the filter through fzf's `FZF_QUERY` environment variable instead of argv.
 
 ## Install
 
@@ -28,7 +30,7 @@ Herdr has no built-in "move tab to workspace", and recreating a tab by replaying
 herdr plugin install AVGVSTVS96/herdr-drovr
 ```
 
-Herdr keybindings live in your config, not the plugin manifest, so add these to `~/.config/herdr/config.toml`:
+Herdr keybindings live in your config, not the plugin manifest, so add these to `~/.config/herdr/config.toml` (`%USERPROFILE%\.config\herdr\config.toml` on Windows):
 
 ```toml
 [[keys.command]]

@@ -246,6 +246,11 @@ function focusDestination(pane: MovedPane): void {
   } catch {}
 }
 
+// The picker's shell glue (fzf reload/preview commands) is platform-specific:
+// fzf executes them through the system shell (sh on Unix, cmd.exe on Windows),
+// so each side gets its own scripts and commands.
+const IS_WIN = process.platform === "win32";
+
 // A failed label lookup falls back silently: the move matters more than the name.
 function sourceTabLabel(srcTab: string): string {
   try {
@@ -311,7 +316,11 @@ function hintArgs(dir: string, left: Hint[], right: Hint[]): string[] {
   }
   const file = path.join(dir, "hints.txt");
   fs.writeFileSync(file, "\n" + lines.join("\n"));
-  return ["--preview", `cat '${file}'`, "--preview-window", `down,${rows + 1},noborder,nowrap,noinfo`];
+  // The preview command runs in the system shell, so the file read must be
+  // spelled per platform (sh `cat` vs cmd `type`); the quotes are what each
+  // shell actually treats as a string delimiter.
+  const read = IS_WIN ? `type "${file}"` : `cat '${file}'`;
+  return ["--preview", read, "--preview-window", `down,${rows + 1},noborder,nowrap,noinfo`];
 }
 
 // The ＋ sentinel rows render in the muted tone (fzf runs with --ansi).
@@ -325,6 +334,9 @@ function mutedRow(label: string, token: string): string {
 // --filter on reload): the ＋ sentinel rows close the list under any query,
 // echo the typed name so "＋ new tab “api”" reads as what enter will create,
 // and enter always lands on the best real match.
+// Unix reload script, executed by fzf as `sh <script> {q}`: filters the
+// candidate file with `fzf --filter`, then appends the sentinel rows (named
+// with the typed query when there is one).
 function searchScript(candidatesExpr: string, sentinels: [string, string][]): string {
   const named = sentinels
     .map(([label, token]) => `printf '\\033[38;5;8m${label} “%s”\\033[0m\\t${token}\\n' "$q"`)
@@ -345,9 +357,80 @@ exit 0
 `;
 }
 
+// Windows PowerShell 5.1 parses BOM-less .ps1 files as ANSI, which would
+// mangle the ＋ and “” literals below; the BOM pins UTF-8.
+const PS1_BOM = "\ufeff";
+
+// Windows reload script, executed by fzf as `cmd /s/c powershell -File <script>`.
+// fzf passes the typed query in its reload environment as FZF_QUERY (raw UTF-8),
+// so the script never has to parse it from argv — immune to every layer of
+// cmd/PowerShell quoting.
+//
+// candidatesExpr is a PowerShell STATEMENT that assigns the candidate file
+// path to $cand (e.g. `$cand = 'C:\…\ws.txt'`, or a bare `if` for the ctrl-t
+// scope toggle). A bare `if` statement works; `(if …)` does not — PowerShell
+// parses a parenthesized if as a command.
+function searchScriptPs(candStatement: string, sentinels: [string, string][]): string {
+  // PowerShell pitfalls worked around in the generated script:
+  // - PS has no `e escape (a backtick before an unknown char is dropped), so
+  //   the ESC byte is interpolated from [char]27 as ${esc}.
+  // - The curly quotes must be backtick-escaped: Windows PowerShell's
+  //   tokenizer treats “ ” as string delimiters.
+  // - ` and $ must be escaped in this JS template literal to stay literal.
+  // - Lines are collected in an array and joined once: @() normalizes the
+  //   single-string / no-match null cases, and each sentinel starts on its
+  //   own line. A real ESC char survives the pipeline to fzf's stdin.
+  const named = sentinels
+    .map(([label, token]) => `$lines += "\${esc}[38;5;8m${label} \`“$q\`”\${esc}[0m\`t${token}"`)
+    .join("\n  ");
+  const plain = sentinels
+    .map(([label, token]) => `$lines += "\${esc}[38;5;8m${label}\${esc}[0m\`t${token}"`)
+    .join("\n  ");
+  return `
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$esc = [char]27
+$q = [string] $env:FZF_QUERY
+${candStatement}
+$lines = @()
+if ($q) {
+  $lines += @(Get-Content -Encoding UTF8 $cand | fzf --filter $q)
+  ${named}
+} else {
+  $lines += @(Get-Content -Encoding UTF8 $cand)
+  ${plain}
+}
+$lines -join "\`r\`n"
+`;
+}
+
+// Windows ctrl-t helper, run inside fzf's transform as `powershell -File`:
+// flips the marker file and prints the change-prompt action for the NEW
+// scope (marker present = cross-workspace view). Only one line is printed —
+// transform executes it as a single action list. The script must be a file
+// (not a -Command string): PS 5.1 parses BOM-less -Command input as ANSI,
+// which would mangle the › in the prompt.
+function togglePsScript(allOn: string): string {
+  return (
+    PS1_BOM +
+    `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+if (Test-Path '${allOn}') { Remove-Item '${allOn}' } else { New-Item -ItemType File -Path '${allOn}' -Force | Out-Null }
+if (Test-Path '${allOn}') { 'change-prompt(move pane anywhere › )' } else { 'change-prompt(move pane to › )' }
+`
+  );
+}
+
 // Reload on every keystroke, debounced: fzf kills the pending reload when the
 // next change fires, so the sleep coalesces fast typing into one search.
 function reloadOnChange(searchSh: string): string[] {
+  if (IS_WIN) {
+    // No `sleep` on the default Windows shell, and the PowerShell reload is
+    // slow to start anyway: fzf kills a pending reload when the next key
+    // arrives, which coalesces fast typing into the final reload. The path is
+    // double-quoted: it survives `cmd /s/c "<command>"` (fzf's Windows
+    // executor) even when the user profile contains spaces.
+    return ["--bind", `change:reload(powershell -NoProfile -ExecutionPolicy Bypass -File "${searchSh}")`];
+  }
   return ["--bind", `change:reload(sleep 0.05; sh '${searchSh}' {q})`];
 }
 
@@ -386,9 +469,20 @@ function moveTabFlow(srcPane: string): number {
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "drovr-"));
   const wsPath = path.join(dir, "workspaces.txt");
-  const searchSh = path.join(dir, "search.sh");
-  fs.writeFileSync(wsPath, wsRows.join("\n"));
-  fs.writeFileSync(searchSh, searchScript(`'${wsPath}'`, [["＋ new workspace", NEW_WS_TOKEN]]));
+  // CRLF line endings on Windows: the reload script reads the file with
+  // Get-Content in line mode, which splits on either, but keep the platform
+  // convention.
+  const EOL = IS_WIN ? "\r\n" : "\n";
+  fs.writeFileSync(wsPath, wsRows.join(EOL) + EOL);
+  // The reload command runs in the system shell, so the search script is
+  // spelled for it.
+  const searchSh = IS_WIN ? path.join(dir, "search.ps1") : path.join(dir, "search.sh");
+  fs.writeFileSync(
+    searchSh,
+    IS_WIN
+      ? PS1_BOM + searchScriptPs(`$cand = '${wsPath}'`, [["＋ new workspace", NEW_WS_TOKEN]])
+      : searchScript(`'${wsPath}'`, [["＋ new workspace", NEW_WS_TOKEN]])
+  );
 
   let fzf: FzfPick;
   try {
@@ -484,21 +578,33 @@ function movePaneFlow(srcPane: string): number {
   const scopedPath = path.join(dir, "scoped.txt");
   const allPath = path.join(dir, "all.txt");
   const allOn = path.join(dir, "all-on");
-  const searchSh = path.join(dir, "search.sh");
-  fs.writeFileSync(scopedPath, currentLines.join("\n"));
-  fs.writeFileSync(allPath, allLines.join("\n"));
+  const EOL = IS_WIN ? "\r\n" : "\n";
+  const searchSh = IS_WIN ? path.join(dir, "search.ps1") : path.join(dir, "search.sh");
+  fs.writeFileSync(scopedPath, currentLines.join(EOL) + EOL);
+  fs.writeFileSync(allPath, allLines.join(EOL) + EOL);
+  // The candidate file expression is spelled for the reload script's shell.
+  // On Windows it is a bare `if` assigning $cand — `(if …)` is not valid
+  // PowerShell (it parses as a command).
+  const sentinelSpec: [string, string][] = [
+    ["＋ new tab", NEW_TAB_TOKEN],
+    ["＋ new workspace", NEW_WS_TOKEN],
+  ];
   fs.writeFileSync(
     searchSh,
-    searchScript(`$(if test -e '${allOn}'; then echo '${allPath}'; else echo '${scopedPath}'; fi)`, [
-      ["＋ new tab", NEW_TAB_TOKEN],
-      ["＋ new workspace", NEW_WS_TOKEN],
-    ])
+    IS_WIN
+      ? PS1_BOM +
+        searchScriptPs(`if (Test-Path '${allOn}') { $cand = '${allPath}' } else { $cand = '${scopedPath}' }`, sentinelSpec)
+      : searchScript(`$(if test -e '${allOn}'; then echo '${allPath}'; else echo '${scopedPath}'; fi)`, sentinelSpec)
   );
   // transform[] (bracket delimiter: the body nests parens) flips the marker
   // and prompt; the chained reload then re-filters against the new scope.
-  const toggle =
-    `if test -e '${allOn}'; then rm '${allOn}'; echo 'change-prompt(move pane to › )'; ` +
-    `else touch '${allOn}'; echo 'change-prompt(move pane anywhere › )'; fi`;
+  // On Windows the flip runs through a small PS helper file: the inline
+  // command would have to survive both cmd.exe and PowerShell quoting.
+  const toggle = IS_WIN
+    ? path.join(dir, "toggle.ps1")
+    : `if test -e '${allOn}'; then rm '${allOn}'; echo 'change-prompt(move pane to › )'; ` +
+      `else touch '${allOn}'; echo 'change-prompt(move pane anywhere › )'; fi`;
+  if (IS_WIN) fs.writeFileSync(toggle, togglePsScript(allOn));
   let fzf: FzfPick;
   try {
     fzf = runFzf(
@@ -516,7 +622,12 @@ function movePaneFlow(srcPane: string): number {
         "--disabled",
         "--expect", "alt-d",
         ...reloadOnChange(searchSh),
-        "--bind", `ctrl-t:transform[${toggle}]+reload(sh '${searchSh}' {q})`,
+        // On Windows the transform body and the reload command both run the
+        // generated .ps1 helpers through powershell -File (path double-quoted,
+        // see reloadOnChange); the Unix form inlines sh one-liners.
+        "--bind", IS_WIN
+          ? `ctrl-t:transform[powershell -NoProfile -ExecutionPolicy Bypass -File "${toggle}"]+reload(powershell -NoProfile -ExecutionPolicy Bypass -File "${searchSh}")`
+          : `ctrl-t:transform[${toggle}]+reload(sh '${searchSh}' {q})`,
       ],
       [...currentLines, mutedRow("＋ new tab", NEW_TAB_TOKEN), mutedRow("＋ new workspace", NEW_WS_TOKEN)].join("\n")
     );
@@ -566,7 +677,7 @@ function main(): number {
   return mode === "pane" ? movePaneFlow(pane) : moveTabFlow(pane);
 }
 
-export { rootFromFlatSnapshot, secondChildRect, anchorOf, leavesOf, paneDestLines, parsePaneChoice, searchScript };
+export { rootFromFlatSnapshot, secondChildRect, anchorOf, leavesOf, paneDestLines, parsePaneChoice, searchScript, searchScriptPs, togglePsScript };
 
 if (process.argv[1] === import.meta.filename) {
   try {
