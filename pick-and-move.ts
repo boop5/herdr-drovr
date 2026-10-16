@@ -654,16 +654,19 @@ function movePaneFlow(srcPane: string): number {
 
   // Omitting --target-pane splits the destination tab's focused pane, which
   // is the intuitive landing spot. A typed query names a new tab/workspace.
+  // --focus (not --no-focus + a later `tab focus`) switches focus to the
+  // destination: herdr focuses the moved PANE in its new tab and follows the
+  // client across workspaces in one step; a post-move `tab focus` would only
+  // select the tab and leave its previous pane focused.
   const name = queryRaw.trim();
   const label = name ? ["--label", name] : [];
-  const moved = move(
+  move(
     choice.dest.kind === "tab"
-      ? ["pane", "move", src.pane_id, "--tab", choice.dest.tabId, "--split", choice.direction, "--no-focus"]
+      ? ["pane", "move", src.pane_id, "--tab", choice.dest.tabId, "--split", choice.direction, "--focus"]
       : choice.dest.kind === "new-tab"
-        ? ["pane", "move", src.pane_id, "--new-tab", "--workspace", src.workspace_id, ...label, "--no-focus"]
-        : ["pane", "move", src.pane_id, "--new-workspace", ...label, "--no-focus"]
+        ? ["pane", "move", src.pane_id, "--new-tab", "--workspace", src.workspace_id, ...label, "--focus"]
+        : ["pane", "move", src.pane_id, "--new-workspace", ...label, "--focus"]
   );
-  focusDestination(moved);
   return 0;
 }
 
